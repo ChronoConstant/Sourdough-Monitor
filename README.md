@@ -9,6 +9,8 @@ dashboard, exactly how far along your starter is and when it peaked.
 Built on a Seeed XIAO ESP32-C3 running [ESPHome](https://esphome.io/),
 publishing over MQTT. Fair warning... I am dumb, Claude built most of this. So please take everything with a grain of LLM flavored salt. 
 
+One small note about the enclosure. Obviously thats designed for a specific jar (Brod and Taylor) so it may or may not fit your project. Also I forgot to put a hole in it for a button. I drilled a hole for my button because I'm janky and didn't want to print it again. I'll update that eventually.
+
 <!-- Add a photo of your build here, e.g.:
 ![Sourdough Monitor](docs/images/prototype.jpg)
 -->
