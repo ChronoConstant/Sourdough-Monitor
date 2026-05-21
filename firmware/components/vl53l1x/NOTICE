@@ -1,0 +1,46 @@
+================================================================================
+NOTICE — bundled third-party component
+================================================================================
+
+This directory (firmware/components/vl53l1x/) contains the "vl53l1x" ESPHome
+external component, which is THIRD-PARTY code, not original to the Sourdough
+Monitor project.
+
+ORIGINAL SOURCE
+    Averyy/esphome-custom-components
+    https://github.com/Averyy/esphome-custom-components
+    Licensed under the MIT License.
+
+This component is bundled here (rather than referenced remotely) so the
+firmware builds reproducibly — a remote component can change or disappear at
+any time. Bundling is permitted by the MIT License.
+
+The component's MIT license applies to the files in THIS directory only. The
+rest of the Sourdough Monitor project is licensed under GPLv3 (see the LICENSE
+file at the repository root). MIT is compatible with GPLv3: MIT-licensed code
+may be incorporated into a GPLv3 project, and the MIT terms continue to apply
+to these specific files.
+
+The original MIT LICENSE file from Averyy's repository should accompany this
+component. If it is missing, obtain it from:
+    https://github.com/Averyy/esphome-custom-components/blob/main/LICENSE
+
+--------------------------------------------------------------------------------
+MODIFICATIONS made by the Sourdough Monitor project
+--------------------------------------------------------------------------------
+
+File: vl53l1x.cpp
+
+  Five calls to the ESPHome i2c helper methods write_register16() and
+  read_register16() were updated to drop a 4th argument (a boolean "stop"
+  flag). Recent versions of ESPHome changed these method signatures from
+  four parameters to three — the I2C stop condition is now handled
+  internally. The upstream component was written against the older 4-arg
+  API and failed to compile against current ESPHome ("candidate expects 3
+  arguments, 4 provided").
+
+  The change is purely an API-compatibility fix. I2C behavior is unchanged.
+  Affected call sites (line numbers as of the upstream version bundled):
+  919, 927, 939, 943, 947 — each lost a trailing ", true" or ", false".
+
+No other files in this directory were modified.

@@ -1,0 +1,19 @@
+# ESPHome build artifacts — large, machine-generated, never committed
+firmware/.esphome/
+.esphome/
+
+# Secrets — Wi-Fi / MQTT / OTA credentials. NEVER commit this file.
+# Builders copy secrets.yaml.example to secrets.yaml and fill in their own.
+secrets.yaml
+firmware/secrets.yaml
+
+# Python bytecode cache (from the bundled ESPHome component)
+__pycache__/
+*.pyc
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/

@@ -1,0 +1,595 @@
+# sourdough.yaml — firmware for the Sourdough Monitor.
+#
+# Hardware: Seeed XIAO ESP32-C3 + SHT31-D + VL53L4CD + push button on D1.
+# See README.md and docs/wiring.md for the full picture.
+#
+# What this firmware does:
+#   - Deep-sleeps between wakes; wakes every ~15 min (or on a button
+#     press) to read sensors, publish over MQTT, and sleep again.
+#   - Reads temperature/humidity from the SHT31-D and ToF distance from
+#     the VL53L4CD.
+#   - Computes starter_height_mm and rise_pct as derived sensors, and
+#     tracks max rise % and average temp/RH over the current feed cycle.
+#   - On Just-Fed press (physical button OR HA button):
+#       * Publishes the prior cycle's stats to sourdough/<jar>/cycle_complete
+#       * Resets per-cycle state and the rise baseline
+#       * Stamps the last-fed timestamp
+#     The new baseline is established adaptively afterwards: the next
+#     reading sets it, then it tracks down to the cycle's low point.
+#   - Exposes d_empty as an HA number entity for calibration.
+#   - Auto-discovers all entities in HA via MQTT discovery.
+
+substitutions:
+  device_name: sourdough
+  friendly_name: Sourdough Monitor
+  jar_id: jar1                  # change if running multiple jars in the future
+  # With deep_sleep enabled, the cadence the *user* cares about (how often
+  # data lands in HA) is sleep_duration. Sensor update_interval just needs
+  # to be short enough that they actually fire during the run_duration
+  # wake window — otherwise they'd never poll.
+  update_interval: 10s          # in-wake sensor polling — fires within run_duration
+  run_duration: 15s             # awake time per wake cycle (Wi-Fi connect + reads + publish)
+  sleep_duration: 15min         # how often the chip wakes for a periodic read
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - logger.log: "Sourdough monitor booted."
+      # If the chip woke up because the button was pressed (vs. periodic
+      # timer wake), execute the just-fed action. The binary_sensor's
+      # on_press may miss the press because the pin can transition high
+      # again before the binary_sensor finishes initializing after deep
+      # sleep. This catches the "button still held at boot" case as a
+      # safety net. User should hold the button for ~1 second when waking
+      # the device to ensure the press is captured.
+      - delay: 250ms
+      - if:
+          condition:
+            binary_sensor.is_on: just_fed_button
+          then:
+            - logger.log: "Wake-from-button detected at boot; firing just-fed action."
+            - script.execute: just_fed_action
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: ESP32C3
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # fast_connect skips the Wi-Fi scan phase, speeding up reconnect after
+  # each deep-sleep wake. Works on any network — safe to leave on.
+  fast_connect: true
+
+  # OPTIONAL — static IP. Saves ~1-2 seconds of DHCP negotiation per wake,
+  # which modestly improves battery life (~15-20% longer between charges).
+  # NOT required — with this block commented out the device uses DHCP and
+  # works on any network with zero configuration.
+  #
+  # To enable: uncomment the block below, and set the four matching values
+  # in secrets.yaml to fit YOUR network. Pick a static_ip outside your
+  # router's DHCP pool (or reserve it in the router by MAC address).
+  #
+  # manual_ip:
+  #   static_ip: !secret static_ip
+  #   gateway: !secret gateway
+  #   subnet: !secret subnet
+  #   dns1: !secret dns1
+
+mqtt:
+  broker: !secret mqtt_broker
+  # MQTT credentials. If your broker requires auth (the HA Mosquitto add-on
+  # does by default), set these in secrets.yaml. If your broker allows
+  # anonymous connections, set both to empty strings ("") in secrets.yaml —
+  # or, if empty strings still get rejected, comment these two lines out.
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  topic_prefix: sourdough/${jar_id}
+  discovery: true
+  discovery_prefix: homeassistant
+  # Disable birth and will messages — with deep sleep, the chip is
+  # intentionally "offline" most of the time. Without these, HA's
+  # discovery omits the availability topic, and HA shows the last known
+  # value indefinitely instead of flipping every entity to "Unknown"
+  # the instant the chip sleeps.
+  #
+  # Trade-off: if the device actually dies, HA won't know — values stay
+  # at their last reported state. Mitigation, if you want it later: a
+  # template sensor that flags the device "stale" if no sensor has
+  # updated for >2 × sleep_duration.
+  birth_message:
+  will_message:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# safe_mode is clamped HARD because its boot-loop protection was holding
+# the chip awake for ~5 minutes on every wake — matching the default
+# reboot_timeout. `disabled: true` alone didn't suppress this in this
+# ESPHome version, so I also set reboot_timeout very low (in case
+# safe_mode triggers anyway, it can't hold the chip awake) and num_attempts
+# very high (so it shouldn't trigger from deep-sleep wakes anyway).
+#
+# Trade-off: if a future OTA push bricks the boot, the chip won't sit
+# awake waiting for a recovery OTA — you'd need to recover via USB.
+# Acceptable given the firmware is established and battery life matters.
+safe_mode:
+  disabled: true
+  num_attempts: 1000000   # never trigger via boot-count
+  reboot_timeout: 1s      # if it does trigger, get out fast
+  boot_is_good_after: 1s  # mark each boot good almost immediately
+
+# ---------------------------------------------------------------------------
+# Deep sleep — chip fully off between wakes for ~50× battery improvement.
+#
+# Each wake: ~15 s awake (Wi-Fi reconnect + sensor reads + MQTT publish),
+# then ~15 min asleep. Button press on GPIO 3 wakes the chip immediately.
+# Average current goes from ~15 mA (modem sleep) to ~0.3 mA (deep sleep),
+# turning 3-day battery life into 6-8 weeks.
+#
+# Trade-offs:
+#   - Button-press response has ~10-15 s latency (the wake-and-connect
+#     time before HA sees the just-fed event).
+#   - HA marks the device "unavailable" between wakes (~14 min of every
+#     15). State history is preserved; the device just isn't online.
+#   - In-flight scripts are protected via deep_sleep.prevent/allow.
+# ---------------------------------------------------------------------------
+deep_sleep:
+  id: deep_sleep_main
+  run_duration: ${run_duration}
+  sleep_duration: ${sleep_duration}
+  wakeup_pin:
+    number: GPIO3
+    allow_other_uses: true    # shared with the binary_sensor below
+    inverted: true            # button pulls pin LOW; wake on that transition
+    mode:
+      input: true
+      pullup: true
+  # IGNORE (default): just sleep at run_duration regardless of pin state.
+  # I previously had KEEP_AWAKE here, which was too eager and kept the
+  # chip awake whenever the pin looked "pressed", even from noise.
+
+time:
+  - platform: sntp
+    id: sntp_time
+
+i2c:
+  sda: GPIO6
+  scl: GPIO7
+  frequency: 100kHz
+
+# The VL53L4CD isn't in ESPHome core. This is a locally-patched copy of
+# Averyy/esphome-custom-components — the upstream repo uses an old i2c
+# API (4-arg write_register16/read_register16) that broke against recent
+# ESPHome. The patch strips the unused 4th arg from 5 call sites in
+# ./components/vl53l1x/vl53l1x.cpp.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [vl53l1x]
+
+# The vl53l1x component requires a top-level hub declaration in addition
+# to the sensor: entry below. Distance mode is auto-forced to "short" for
+# L4CD hardware regardless of what's set here. The id lets the just-fed
+# script call component.update on the hub to force a fresh I²C read.
+vl53l1x:
+  id: vl53l1x_hub
+  distance_mode: short
+  update_interval: ${update_interval}
+
+# -----------------------------------------------------------------------------
+# Persisted state
+#
+# These survive reboot and OTA via restore_value: true. Reset only when the
+# Just-Fed action explicitly clears them.
+# -----------------------------------------------------------------------------
+globals:
+  # Empty-jar distance (sensor face → jar bottom in mm).
+  # Mirrors the d_empty HA number entity below; both stay in sync.
+  - id: d_empty_mm
+    type: float
+    restore_value: true
+    initial_value: '200.0'
+
+  # Distance to the starter surface immediately after the most recent feed.
+  # 0.0 means "no feed has been recorded yet" — rise_pct returns NAN in that case.
+  - id: d_after_feed_mm
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+
+  # Epoch seconds of the most recent Just-Fed press.
+  - id: last_fed_ts
+    type: int
+    restore_value: true
+    initial_value: '0'
+
+  # Running max rise % during the current cycle. Reset on Just-Fed.
+  - id: max_rise_pct_this_cycle
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+
+  # Latch so a "feed now" alert (Phase 3) only fires once per cycle.
+  - id: feed_now_alerted
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+
+  # No baseline-state flag is needed. d_after_feed_mm itself is the state:
+  #   - 0.0 = no feed has been recorded yet OR a press just happened and
+  #           the first post-press reading hasn't landed. Rise % returns
+  #           NaN in this state (the dashboard card renders that as 0).
+  #   - > 0 = the lowest ToF distance seen in the current cycle. Updates
+  #           on every reading where the starter has sunk further; stays
+  #           put once the starter starts rising.
+
+  # Running sums for environmental averages over the cycle.
+  - id: cycle_temp_sum
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+  - id: cycle_temp_count
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: cycle_rh_sum
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+  - id: cycle_rh_count
+    type: int
+    restore_value: true
+    initial_value: '0'
+
+# -----------------------------------------------------------------------------
+# Sensors
+# -----------------------------------------------------------------------------
+sensor:
+  # Temperature + humidity from the SHT31-D
+  - platform: sht3xd
+    address: 0x44
+    update_interval: ${update_interval}
+    temperature:
+      name: "Temperature"
+      id: temperature
+      state_class: measurement
+      on_value:
+        then:
+          - lambda: |-
+              id(cycle_temp_sum) += x;
+              id(cycle_temp_count) += 1;
+    humidity:
+      name: "Humidity"
+      id: humidity
+      state_class: measurement
+      on_value:
+        then:
+          - lambda: |-
+              id(cycle_rh_sum) += x;
+              id(cycle_rh_count) += 1;
+
+  # Time-of-flight distance from the VL53L4CD via the external component.
+  # Timing/mode lives on the top-level vl53l1x: hub block above; this entry
+  # just exposes the distance reading to HA.
+  - platform: vl53l1x
+    distance:
+      name: "ToF Distance"
+      id: tof_distance_mm
+      unit_of_measurement: mm
+      accuracy_decimals: 1
+      state_class: measurement
+      # Clear device_class so HA stops auto-converting mm → inches on
+      # imperial-system accounts. The unit_of_measurement above is the
+      # display unit.
+      device_class: ""
+      # Force HA to register an update event on every publish, even when
+      # the value didn't change. Useful for confirming Just Fed force-read
+      # actually fired (timestamp updates even if value is identical).
+      force_update: true
+      filters:
+        # Reject obviously-invalid readings (out of range, sensor errors).
+        # No median/smoothing — the natural signal (rise over hours) dwarfs
+        # the L4CD's ±1–2 mm per-reading noise, and the median was biasing
+        # the post-feed baseline toward stale pre-feed values.
+        - lambda: |-
+            if (x < 10 || x > 1300 || std::isnan(x)) return {};
+            return x;
+      # Adaptive baseline tracking: instead of a fixed settling delay,
+      # the baseline auto-tracks the lowest point the starter reaches.
+      #
+      # Two cases:
+      #   1. d_after_feed_mm == 0.0 → just-fed, no baseline yet.
+      #      Take this reading as the initial baseline.
+      #   2. x > d_after_feed_mm → starter has sunk below the current
+      #      baseline (larger ToF distance = lower starter height).
+      #      Update the baseline to this new low point.
+      #   3. x ≤ d_after_feed_mm → starter is at or above baseline.
+      #      Leave the baseline alone; this is what locks it once the
+      #      starter starts rising.
+      #
+      # Net effect: baseline finds the natural low point of the cycle
+      # without a fixed wait time. Rise % reads ~0 % during settling
+      # and climbs once active fermentation begins.
+      on_value:
+        then:
+          - if:
+              condition:
+                lambda: |-
+                  return id(d_after_feed_mm) <= 0.0 || x > id(d_after_feed_mm);
+              then:
+                - lambda: |-
+                    bool first_reading = (id(d_after_feed_mm) <= 0.0);
+                    id(d_after_feed_mm) = x;
+                    if (first_reading) {
+                      ESP_LOGD("main", "Initial baseline after feed: d_after_feed=%.1fmm", x);
+                    } else {
+                      ESP_LOGD("main", "Baseline lowered (starter sank): d_after_feed=%.1fmm", x);
+                    }
+                - component.update: starter_height_mm
+                - component.update: rise_pct
+
+  # Derived: how high the starter currently sits above the jar bottom.
+  - platform: template
+    name: "Starter Height"
+    id: starter_height_mm
+    unit_of_measurement: mm
+    accuracy_decimals: 1
+    state_class: measurement
+    device_class: ""        # keep HA from converting mm → inches
+    update_interval: ${update_interval}
+    lambda: |-
+      if (isnan(id(tof_distance_mm).state)) return NAN;
+      float h = id(d_empty_mm) - id(tof_distance_mm).state;
+      if (h < 0) h = 0;
+      return h;
+
+  # Derived: % rise above the post-feed baseline.
+  #   rise_pct = ((current_height - baseline_height) / baseline_height) * 100
+  - platform: template
+    name: "Rise %"
+    id: rise_pct
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: ${update_interval}
+    lambda: |-
+      // No baseline yet (fresh device, or post-press before first ToF
+      // reading lands): report NaN instead of a stale or wrong value.
+      // The dashboard card renders NaN as 0.
+      if (id(d_after_feed_mm) <= 0) return NAN;
+      // Compute current height directly from the ToF reading instead of
+      // going through id(starter_height_mm).state. That state is from
+      // the last time the template sensor ran its own lambda, which can
+      // lag the latest ToF read inside the on_value handler. Reading
+      // tof_distance_mm.state directly guarantees rise is computed
+      // against the same fresh reading that just landed.
+      if (isnan(id(tof_distance_mm).state)) return NAN;
+      float baseline = id(d_empty_mm) - id(d_after_feed_mm);
+      if (baseline <= 0) return NAN;
+      float current = id(d_empty_mm) - id(tof_distance_mm).state;
+      if (current < 0) current = 0;
+      return ((current - baseline) / baseline) * 100.0;
+    on_value:
+      then:
+        - lambda: |-
+            if (!isnan(x) && x > id(max_rise_pct_this_cycle)) {
+              id(max_rise_pct_this_cycle) = x;
+            }
+        # Re-publish Max Rise % immediately so it tracks the same reading
+        # that produced the new Rise % value, rather than waiting for its
+        # own update_interval to come around. Otherwise HA-side alerting
+        # logic sees Max lag Rise by up to one polling period.
+        - component.update: max_rise_pct_sensor
+
+  # Expose the running max for the current cycle as its own sensor.
+  - platform: template
+    name: "Max Rise % This Cycle"
+    id: max_rise_pct_sensor
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: ${update_interval}
+    lambda: 'return id(max_rise_pct_this_cycle);'
+
+  # Hours since the last feed press — useful for dashboards.
+  - platform: template
+    name: "Hours Since Feed"
+    id: hours_since_feed
+    unit_of_measurement: h
+    accuracy_decimals: 2
+    state_class: measurement
+    update_interval: ${update_interval}
+    lambda: |-
+      if (id(last_fed_ts) == 0) return NAN;
+      auto now = id(sntp_time).now();
+      if (!now.is_valid()) return NAN;
+      return (now.timestamp - id(last_fed_ts)) / 3600.0;
+
+  # ---------------------------------------------------------------------------
+  # Battery monitoring (LiPo via voltage divider on GPIO 4 / D2)
+  #
+  # HARDWARE REQUIRED before these readings are meaningful:
+  #   - Two equal-value resistors (100 kΩ each recommended) wired as a
+  #     divider between BAT+ and GND, midpoint to GPIO 4.
+  #   - BAT+ is the LiPo positive terminal — the same pad on the XIAO's
+  #     underside that the battery already solders to.
+  #   - Until the divider exists, GPIO 4 floats and these sensors report
+  #     garbage. That's expected; they go quiet once the resistors are in.
+  # ---------------------------------------------------------------------------
+  - platform: adc
+    pin: GPIO4
+    id: battery_voltage
+    name: "Battery Voltage"
+    update_interval: ${update_interval}
+    attenuation: 12db        # full 0–3.3 V ADC range
+    accuracy_decimals: 2
+    state_class: measurement
+    device_class: voltage
+    unit_of_measurement: V
+    filters:
+      - multiply: 2.0        # undo the 1:1 voltage divider (R_top == R_bot)
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+
+  # Battery percentage from voltage. LiPo discharge curves are nonlinear
+  # (flat in the middle), so this is a piecewise approximation rather than
+  # simple linear. Good for "high / medium / low" indication; not lab-grade.
+  - platform: template
+    name: "Battery Level"
+    id: battery_level
+    update_interval: ${update_interval}
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    device_class: battery
+    lambda: |-
+      float v = id(battery_voltage).state;
+      if (isnan(v)) return NAN;
+      if (v >= 4.20) return 100.0;
+      if (v >= 4.00) return 80.0 + (v - 4.00) / (4.20 - 4.00) * 20.0;
+      if (v >= 3.80) return 50.0 + (v - 3.80) / (4.00 - 3.80) * 30.0;
+      if (v >= 3.60) return 20.0 + (v - 3.60) / (3.80 - 3.60) * 30.0;
+      if (v >= 3.30) return  0.0 + (v - 3.30) / (3.60 - 3.30) * 20.0;
+      return 0.0;
+
+# -----------------------------------------------------------------------------
+# Physical Just-Fed button on D1 (GPIO3)
+# -----------------------------------------------------------------------------
+binary_sensor:
+  - platform: gpio
+    name: "Just Fed Button"
+    id: just_fed_button
+    pin:
+      number: GPIO3
+      allow_other_uses: true    # shared with the deep_sleep wakeup_pin
+      mode:
+        input: true
+        pullup: true
+      inverted: true            # button to GND → reads as "on" when pressed
+    filters:
+      - delayed_on: 50ms    # debounce
+    on_press:
+      then:
+        - script.execute: just_fed_action
+
+# -----------------------------------------------------------------------------
+# HA-mirror Just-Fed button (phone/dashboard trigger)
+# -----------------------------------------------------------------------------
+button:
+  - platform: template
+    name: "Just Fed"
+    id: just_fed_ha_button
+    on_press:
+      then:
+        - script.execute: just_fed_action
+
+# -----------------------------------------------------------------------------
+# d_empty calibration — settable from HA, persists across reboots.
+#
+# Default of 200 mm is a placeholder; set this from HA to the actual
+# sensor-to-jar-bottom distance once the rig is mounted.
+# -----------------------------------------------------------------------------
+number:
+  - platform: template
+    name: "Empty Jar Distance (mm)"
+    id: d_empty_number
+    min_value: 50
+    max_value: 400
+    step: 0.5
+    initial_value: 200.0
+    unit_of_measurement: mm
+    device_class: ""        # keep HA from converting mm → inches
+    optimistic: true
+    restore_value: true
+    set_action:
+      then:
+        - lambda: 'id(d_empty_mm) = x;'
+
+# -----------------------------------------------------------------------------
+# Just-Fed action — invoked by both the physical and HA buttons.
+#
+# Sequence:
+#   1. Force a fresh ToF read and snapshot it as the new baseline.
+#   2. Stamp last_fed_ts.
+#   3. If a prior cycle existed, publish its stats to cycle_complete.
+#   4. Reset per-cycle in-flight state.
+#   5. Log a confirmation line.
+# -----------------------------------------------------------------------------
+script:
+  - id: just_fed_action
+    # mode: restart so a re-press resets state in case the lid wasn't
+    # quite right the first time.
+    mode: restart
+    then:
+      # Prevent deep sleep while publishing — don't want the chip
+      # to sleep mid-MQTT-publish and lose the cycle_complete archive.
+      - deep_sleep.prevent: deep_sleep_main
+
+      # 1. Stamp the feed time.
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          if (now.is_valid()) {
+            id(last_fed_ts) = now.timestamp;
+          }
+
+      # 2. Publish the previous cycle's summary (if there was a real one)
+      #    BEFORE resetting the cycle stats.
+      - if:
+          condition:
+            lambda: 'return id(max_rise_pct_this_cycle) > 0.0;'
+          then:
+            - mqtt.publish_json:
+                topic: sourdough/${jar_id}/cycle_complete
+                payload: |-
+                  root["jar_id"] = "${jar_id}";
+                  root["max_rise_pct"] = id(max_rise_pct_this_cycle);
+                  root["avg_temp_c"] = id(cycle_temp_count) > 0
+                      ? id(cycle_temp_sum) / id(cycle_temp_count)
+                      : 0.0;
+                  root["avg_rh_pct"] = id(cycle_rh_count) > 0
+                      ? id(cycle_rh_sum) / id(cycle_rh_count)
+                      : 0.0;
+                  root["ended_at"] = id(last_fed_ts);
+
+      # 3. Reset baseline (sentinel = 0) and cycle state. The first ToF
+      #    reading after this becomes the initial baseline; subsequent
+      #    readings update it downward if the starter sinks further.
+      #    Survives deep sleep cycles because d_after_feed_mm is persisted.
+      - lambda: |-
+          id(d_after_feed_mm) = 0.0;
+          id(max_rise_pct_this_cycle) = 0.0;
+          id(feed_now_alerted) = false;
+          id(cycle_temp_sum) = 0.0;
+          id(cycle_temp_count) = 0;
+          id(cycle_rh_sum) = 0.0;
+          id(cycle_rh_count) = 0;
+
+      # 4. Force the derived sensors to publish their post-press values.
+      #    Rise % publishes NaN here (no baseline yet); the proper value
+      #    follows once on_value fires on the next ToF read.
+      - component.update: rise_pct
+      - component.update: max_rise_pct_sensor
+      - component.update: hours_since_feed
+
+      - logger.log: "Just Fed: baseline reset; awaiting next ToF read."
+
+      # Give MQTT a moment to actually transmit the cycle_complete archive
+      # and the forced sensor updates before allowing sleep.
+      - delay: 2s
+
+      # Let the chip sleep again. The settling delay isn't enforced here —
+      # it's enforced in the ToF on_value handler via time comparison.
+      - deep_sleep.allow: deep_sleep_main

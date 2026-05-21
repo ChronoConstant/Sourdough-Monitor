@@ -1,0 +1,131 @@
+# Sourdough peak detection — Phase 3 starter
+#
+# Two pieces:
+#   1. A template binary_sensor that flips on when the starter has clearly
+#      come off its peak (current rise has dropped below max for a sustained
+#      period). This is the "past peak — use or refrigerate" signal.
+#   2. An automation that sends a notification when that sensor flips on.
+#
+# Tuning knobs are gathered at the top of each section. Adjust based on
+# what real cycles look like for your starter.
+#
+# WHERE THESE GO IN HA:
+#   - The `template:` block goes into your configuration.yaml (or whichever
+#     file your `template: !include …` points at).
+#   - The `automation:` block goes into automations.yaml (or wherever your
+#     `automation: !include …` points). The HA UI can also import each
+#     automation individually via Settings → Automations & Scenes → Create
+#     → from YAML.
+#
+# After adding, restart HA (or reload Templates + Automations from
+# Developer Tools → YAML) for the new entities to appear.
+
+# ────────────────────────────────────────────────────────────────────────────
+# 1. Template binary sensor: "Sourdough Past Peak"
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Flips ON when:
+#   - The cycle has actually risen meaningfully (max > min_peak_threshold),
+#     so this doesn't trigger on noise during the lag phase, AND
+#   - Current rise has dropped below max by at least drop_threshold,
+#     so single-reading jitter doesn't flap the sensor, AND
+#   - That condition has held continuously for sustained_minutes,
+#     so a brief dip doesn't trigger.
+#
+# Flips OFF immediately if any of the above stop being true. In practice
+# the only thing that turns it off is pressing Just Fed (which resets
+# Max Rise % to 0, dropping the cycle below min_peak_threshold).
+#
+# TUNING THESE THREE NUMBERS is the main thing you'll do after a few
+# real cycles:
+#   - min_peak_threshold: minimum max rise % that counts as "actually peaked".
+#     Start at 50 (i.e., starter must have at least 1.5× the post-feed volume
+#     before it can count as "past peak").
+#   - drop_threshold: how much below max counts as "really falling".
+#     Start at 5 (current must be at least 5 percentage points below max).
+#   - sustained_minutes: how long the drop must hold. With the ~15-min
+#     deep-sleep wake cycle, 30 minutes is about 2 consecutive readings.
+#     Lower = faster alert but more prone to noise; higher = later but
+#     more confident.
+
+template:
+  - binary_sensor:
+      - name: "Sourdough Past Peak"
+        unique_id: sourdough_past_peak
+        # icon shows up in HA — purely cosmetic
+        icon: >-
+          {% if is_state('binary_sensor.sourdough_past_peak', 'on') %}
+            mdi:chart-bell-curve-cumulative
+          {% else %}
+            mdi:trending-up
+          {% endif %}
+        state: >-
+          {% set rise = states('sensor.sourdough_monitor_rise') | float(0) %}
+          {% set max  = states('sensor.sourdough_monitor_max_rise_this_cycle') | float(0) %}
+          {% set min_peak_threshold = 50 %}
+          {% set drop_threshold = 5 %}
+          {{ max > min_peak_threshold and rise < (max - drop_threshold) }}
+        delay_on: "00:30:00"   # ← sustained_minutes: condition must hold this long before going ON
+        delay_off: "00:00:00"  # turn OFF instantly when condition stops (e.g., on next feed)
+        attributes:
+          max_rise_at_trigger: >-
+            {{ states('sensor.sourdough_monitor_max_rise_this_cycle') }}
+          current_rise: >-
+            {{ states('sensor.sourdough_monitor_rise') }}
+
+# ────────────────────────────────────────────────────────────────────────────
+# 2. Automation: notify when past peak
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Fires once when binary_sensor.sourdough_past_peak transitions from off
+# to on. Sends a mobile notification.
+#
+# SWAP THE NOTIFY SERVICE BELOW for whatever you actually use — examples:
+#   - notify.mobile_app_<your_device>   (HA Companion app on your phone)
+#   - notify.notify                     (HA's default "all configured services")
+#   - notify.telegram                   (Telegram bot)
+#   - notify.alexa_media                (announce on an Echo)
+
+automation:
+  - alias: "Sourdough — past peak alert"
+    id: sourdough_past_peak_alert
+    description: >
+      Fires when the starter has clearly come off peak (current rise has
+      dropped meaningfully below the cycle's max and stayed there).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.sourdough_past_peak
+        from: "off"
+        to: "on"
+    action:
+      - service: notify.notify   # ← change to your actual notify service
+        data:
+          title: "Sourdough is past peak"
+          message: >-
+            Starter peaked at {{ states('sensor.sourdough_monitor_max_rise_this_cycle') | round(0) }}%
+            and is now at {{ states('sensor.sourdough_monitor_rise') | round(0) }}%.
+            Use it or refrigerate.
+
+# ────────────────────────────────────────────────────────────────────────────
+# Future refinements (not built yet)
+# ────────────────────────────────────────────────────────────────────────────
+#
+# - "Approaching peak" alert: trigger BEFORE peak, not after. Needs a rolling
+#   rise-rate calculation (e.g. derivative_sensor or a template comparing
+#   current rise to rise 1 hour ago). Fire when the rate decelerates while
+#   rise is still > some "approaching" threshold. Gives you a "use within
+#   the next hour" heads-up rather than a "you peaked half an hour ago"
+#   notification.
+#
+# - Temperature-adjusted thresholds: a starter at 80 °F peaks at a different
+#   absolute rise % than the same starter at 65 °F. After a few cycles of
+#   real data, you can build a template that scales min_peak_threshold
+#   based on average chamber temperature during the cycle.
+#
+# - "Struggling starter" alert: rise stays below some threshold (e.g., 30 %)
+#   N hours after a feed at a reasonable temperature → something's off
+#   (cold spot, hungry starter, contamination).
+#
+# - "Past peak by N hours" follow-up alert: if you missed the first one,
+#   nag again at a wider drop_threshold.

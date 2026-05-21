@@ -1,0 +1,43 @@
+# sourdough-scan.yaml — minimal I²C bus check for the bench rig.
+#
+# Goal: flash this once, watch the boot log, confirm both sensors respond.
+#   Expect to see:
+#     [I][i2c.idf:170]: Found i2c device at address 0x29   ← VL53L4CD
+#     [I][i2c.idf:170]: Found i2c device at address 0x44   ← SHT31-D
+#
+# Once both addresses show, this config is done — the next step is the
+# real firmware (sourdough.yaml) with the sensor components, MQTT, etc.
+
+esphome:
+  name: sourdough-scan
+  friendly_name: Sourdough Scanner
+
+esp32:
+  # "esp32-c3-devkitm-1" is the generic C3 board name and works fine for
+  # the Seeed XIAO ESP32-C3. If your ESPHome is recent enough you can
+  # also use "seeed_xiao_esp32c3" — either is correct.
+  board: esp32-c3-devkitm-1
+  variant: ESP32C3
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  # The XIAO C3's USB-C is wired to the chip's native USB-Serial/JTAG
+  # peripheral, NOT to UART0. This line routes logs to that USB port so
+  # `esphome logs` actually shows something on the same cable you flashed
+  # with. Without it, logs go to UART0 pins that aren't broken out.
+  hardware_uart: USB_SERIAL_JTAG
+
+# Wi-Fi is optional for a one-shot scan but useful for OTA later.
+# Fill in secrets.yaml (see secrets.yaml.example) or remove this block
+# if you'd rather flash USB-only for now.
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+i2c:
+  sda: GPIO6        # D4 on the XIAO silkscreen ("SDA")
+  scl: GPIO7        # D5 on the XIAO silkscreen ("SCL")
+  scan: true
+  frequency: 100kHz

@@ -1,0 +1,177 @@
+# Sourdough Monitor — vertical wall dashboard card
+#
+# Designed for a 1/3-screen-wide, tall vertical column on a wall-mounted
+# Home Assistant dashboard. Uses HACS cards:
+#   - mushroom-template-card  (the headline Rise % readout)
+#   - mushroom-chips-card     (the compact stats row)
+#   - mini-graph-card         (the 24h history curve)
+#   - button-card OR mushroom-button-card (the Just Fed action)
+#
+# Paste this as the card definition for a Manual Card on your dashboard,
+# OR drop it into a `cards:` list inside a vertical-stack.
+#
+# Adjust the entity IDs at the top of the substitutions to match how HA
+# named them in your install — the names below assume the device's
+# friendly_name is "Sourdough Monitor". Check Settings → Devices → MQTT →
+# the sourdough device to see the exact entity IDs HA created.
+
+type: vertical-stack
+cards:
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Headline: big Rise % readout. Color shifts from gray (rest) → green
+  # (rising) → orange (approaching peak) → red (peak zone, time to use).
+  # ─────────────────────────────────────────────────────────────────────
+  - type: custom:mushroom-template-card
+    primary: >-
+      {% set r = states('sensor.sourdough_monitor_rise') | float(0) %}
+      {{ '%.0f' | format(r) }}%
+    secondary: >-
+      {% set h_total = states('sensor.sourdough_monitor_hours_since_feed') | float(none) %}
+      {% if h_total is none %}
+        —
+      {% else %}
+        {% set h = h_total | int %}
+        {% set m = ((h_total - h) * 60) | round(0) | int %}
+        {{ '%dh %02dm since feed' | format(h, m) }}
+      {% endif %}
+    icon: mdi:bread-slice
+    icon_color: >-
+      {% set r = states('sensor.sourdough_monitor_rise') | float(0) %}
+      {% if r < 25 %} grey
+      {% elif r < 75 %} green
+      {% elif r < 150 %} orange
+      {% else %} red
+      {% endif %}
+    fill_container: true
+    multiline_secondary: true
+    tap_action:
+      action: more-info
+      entity: sensor.sourdough_monitor_rise
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Compact stats row: time since feed, temp, humidity, max rise.
+  # Chips wrap to two rows in narrow columns, which is fine.
+  # ─────────────────────────────────────────────────────────────────────
+  - type: custom:mushroom-chips-card
+    alignment: center
+    chips:
+      - type: template
+        icon: mdi:timer-sand
+        content: >-
+          {% set h = states('sensor.sourdough_monitor_hours_since_feed') | float(0) %}
+          {{ '%.1f h' | format(h) }}
+        icon_color: blue
+        tap_action:
+          action: more-info
+          entity: sensor.sourdough_monitor_hours_since_feed
+      - type: template
+        icon: mdi:ruler-square
+        content: >-
+          {{ states('sensor.sourdough_monitor_starter_height') | round(0) }} mm
+        icon_color: brown
+        tap_action:
+          action: more-info
+          entity: sensor.sourdough_monitor_starter_height
+      - type: template
+        icon: mdi:thermometer
+        content: '{{ states("sensor.sourdough_monitor_temperature") }}°'
+        icon_color: orange
+        tap_action:
+          action: more-info
+          entity: sensor.sourdough_monitor_temperature
+      - type: template
+        icon: mdi:water-percent
+        content: '{{ states("sensor.sourdough_monitor_humidity") | round(0) }}%'
+        icon_color: teal
+        tap_action:
+          action: more-info
+          entity: sensor.sourdough_monitor_humidity
+      - type: template
+        icon: mdi:trending-up
+        content: >-
+          {{ states('sensor.sourdough_monitor_max_rise_this_cycle') | round(0) }}% max
+        icon_color: purple
+        tap_action:
+          action: more-info
+          entity: sensor.sourdough_monitor_max_rise_this_cycle
+      # Peak-detection state. Pulls from the template binary_sensor in
+      # peak-detection.yaml. Goes red with "Past peak" when fired;
+      # subtle gray "Watching" otherwise.
+      - type: template
+        icon: >-
+          {% if is_state('binary_sensor.sourdough_past_peak', 'on') %}
+            mdi:bell-alert
+          {% else %}
+            mdi:bell-outline
+          {% endif %}
+        content: >-
+          {% if is_state('binary_sensor.sourdough_past_peak', 'on') %}
+            Past peak
+          {% else %}
+            Watching
+          {% endif %}
+        icon_color: >-
+          {% if is_state('binary_sensor.sourdough_past_peak', 'on') %}
+            red
+          {% else %}
+            grey
+          {% endif %}
+        tap_action:
+          action: more-info
+          entity: binary_sensor.sourdough_past_peak
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 24-hour rise curve. mini-graph-card draws cleanly in a narrow column
+  # and supports color thresholds matching the headline card.
+  # ─────────────────────────────────────────────────────────────────────
+  - type: custom:mini-graph-card
+    entities:
+      - entity: sensor.sourdough_monitor_rise
+        name: Rise %
+        show_state: false
+        show_indicator: false
+    hours_to_show: 24
+    points_per_hour: 6   # one point per 10 min; matches roughly 2x the polling rate
+    line_width: 3
+    smoothing: false     # no firmware-side smoothing; raw data is fine
+    show:
+      labels: true
+      labels_secondary: false
+      legend: false
+      name: false
+      icon: false
+      extrema: true
+      average: false
+      fill: fade
+    color_thresholds:
+      - value: 0
+        color: '#888888'
+      - value: 25
+        color: '#4CAF50'
+      - value: 75
+        color: '#FF9800'
+      - value: 150
+        color: '#F44336'
+    color_thresholds_transition: smooth
+    decimals: 0
+    height: 220
+    lower_bound: 0
+    # No upper_bound — let the graph autoscale to the cycle's max
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Just Fed action. Big tap target at the bottom of the column.
+  # ─────────────────────────────────────────────────────────────────────
+  - type: custom:mushroom-template-card
+    primary: Just Fed
+    secondary: Mark a new cycle
+    icon: mdi:silverware-fork-knife
+    icon_color: brown
+    fill_container: true
+    tap_action:
+      action: call-service
+      service: button.press
+      target:
+        entity_id: button.sourdough_monitor_just_fed
+      confirmation:
+        text: Mark a new feed cycle?
